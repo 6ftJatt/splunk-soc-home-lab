@@ -2,14 +2,14 @@
 
 A home lab built to practice the daily work of a SOC analyst: stand up a Windows domain, ship its logs to a SIEM, run a brute-force attack against it, and write a detection and alert for it.
 
-**Status:** Parts 1 and 2 (Active Directory domain, Splunk server) are complete. Parts 3 and 4 (log forwarding, attack/detect/alert) are in progress. This README is updated as each part is finished.
+**Status:** All four parts are complete: Active Directory domain, Splunk server, log forwarding, and a brute-force attack with a working detection and scheduled alert.
 
 | Part | What | Status |
 |------|------|--------|
 | 1 | Windows Server 2022 domain controller + Windows 11 domain client on an isolated network | Done |
 | 2 | Splunk Enterprise on Ubuntu Server 24.04 | Done |
-| 3 | Audit policy + Splunk Universal Forwarders on both Windows machines | Planned |
-| 4 | Brute-force attack, detection search (Event IDs 4625 / 4740), scheduled alert | Planned |
+| 3 | Audit policy + Splunk Universal Forwarders on both Windows machines | Done |
+| 4 | Brute-force attack, detection search (Event IDs 4625 / 4740), scheduled alert | Done |
 
 ## Lab design
 
@@ -61,6 +61,31 @@ Everything runs in VirtualBox on a single host, on an isolated NAT Network so th
 8. **Receiving on port 9997** for the forwarders. ([24](screenshots/24-splunk-receiving-9997.png))
 9. **Created the `endpoint` index** for the Windows logs. ([25](screenshots/25-splunk-endpoint-index.png))
 
+## Part 3: audit policy and log forwarding
+
+1. **Audit policy (Default Domain Policy).** Turned on Success and Failure auditing for Audit Logon, Audit Credential Validation and Audit User Account Management, so Windows writes the failed-logon (4625) and lockout (4740) events the detection will depend on. ([26](screenshots/26-gpo-audit-logon.png), [27](screenshots/27-gpo-audit-credential-validation.png), [28](screenshots/28-gpo-audit-user-account-management.png))
+2. **Account lockout threshold of 5**, so the Part 4 attack locks the target account. ([29](screenshots/29-gpo-account-lockout-threshold.png))
+3. **Splunk Universal Forwarder on DC01**, pointed at 192.168.10.10:9997, with an `inputs.conf` that collects the Windows Security and System logs into the `endpoint` index. ([30](screenshots/30-dc01-universal-forwarder-installed.png), [31](screenshots/31-dc01-inputs-conf-save-as.png))
+4. **Same on CLIENT01**, installed as the local administrator, then `gpupdate /force` so the audit policy applies there too. ([35](screenshots/35-client01-universal-forwarder-installed.png), [36](screenshots/36-client01-forwarder-restart-gpupdate.png))
+5. **Verified in Splunk** with `index=endpoint | stats count by host, source`: Security and System events from both DC01 and CLIENT01. ([34](screenshots/34-splunk-dc01-logs-arriving.png), [37](screenshots/37-splunk-both-hosts-logging.png))
+
+## Part 4: attack, detection, alert
+
+1. **Attack.** From CLIENT01, a PowerShell loop made 10 failed logon attempts against `jsmith` with wrong passwords. ([38](screenshots/38-client01-brute-force-script-run.png))
+2. **Found the failed logons (Event ID 4625)** in Splunk with `index=endpoint EventCode=4625`. ([39](screenshots/39-splunk-4625-failed-logons-raw.png))
+3. **Found a mistake in my own lab.** Every 4625 said "Account currently disabled" and there was no lockout: `jsmith` had been created disabled, so the attack never tested the lockout policy. Enabled the account, reset the password, re-ran the attack. ([40](screenshots/40-splunk-4625-account-disabled.png), [41](screenshots/41-splunk-4625-bad-password-after-fix.png))
+4. **Found the lockout (Event ID 4740)** on DC01 after the threshold of 5 was hit. ([42](screenshots/42-splunk-4740-jsmith-lockout.png))
+5. **Detection search.** Failed logons grouped by host and target account, flagging 5 or more:
+   ```
+   index=endpoint EventCode=4625
+   | eval target=mvindex(Account_Name, 1)
+   | stats count AS failures BY host, target
+   | where failures >= 5
+   ```
+   `Account_Name` is multivalue in 4625 events: index 0 is the account that made the request, index 1 is the account being logged on to, which is why the search uses `mvindex(..., 1)`. Result: CLIENT01 / jsmith / 15. ([43](screenshots/43-splunk-detection-search-jsmith-15.png))
+6. **Scheduled alert** "Brute force: 5+ failed logons": cron `*/5 * * * *`, last 15 minutes, trigger when results are greater than 0, action Add to Triggered Alerts. Alerting needs the Splunk trial license, since the Free license disables it. ([44](screenshots/44-splunk-save-as-alert-settings.png))
+7. **Verified it fired.** The scheduler log shows the run at 16:35:01 with result_count 1, and the alert appears under Activity > Triggered Alerts. ([45](screenshots/45-splunk-scheduler-alert-ran.png), [46](screenshots/46-splunk-fired-alerts-brute-force.png), [47](screenshots/47-splunk-triggered-alerts-page.png))
+
 ## What broke and how I fixed it
 
 - **The SOCLab network showed the default 10.0.2.0/24 prefix and DHCP on.** The edit had not been applied. Retyped the prefix, unchecked DHCP, clicked Apply, then re-selected the row to confirm it stuck. ([screenshot 1](screenshots/01-nat-networks-before-soclab.png))
@@ -71,14 +96,15 @@ Everything runs in VirtualBox on a single host, on an isolated NAT Network so th
 - **Active Directory rejected a password.** The default complexity policy refuses passwords that contain three or more consecutive characters of the account's own name. Used a password that doesn't.
 - **CLIENT01 stayed on a black screen at first boot.** Boot order was greyed out because the VM uses UEFI (normal), and the ISO and settings were correct. Rebuilding the VM did not help. Fix: Settings > Display > Graphics Controller from VBoxSVGA to VMSVGA.
 - **`splunk stop` did nothing and `enable boot-start` refused to run.** I had started Splunk as the `splunk` user but ran stop as root, and this Splunk version refuses to manage the process as root, so boot-start still saw it running and `Splunkd.service` did not exist. Fix: stop it as the `splunk` user (`sudo -u splunk /opt/splunk/bin/splunk stop`), then run `enable boot-start -user splunk -systemd-managed 1`, then `sudo systemctl start Splunkd`. ([23](screenshots/23-splunk-boot-start-error-and-fix.png))
+- **The DC01 forwarder showed the Splunk server as "configured but inactive".** `Test-NetConnection 192.168.10.10 -Port 9997` failed with DestinationHostUnreachable. Cause: the SPLUNK VM was powered off. Fix: start SPLUNK first and give Splunk a couple of minutes to come up (boot-start handles it); the forwarder then connected and the logs flowed. Lesson: the SIEM has to be up before the machines that send to it. ([32](screenshots/32-dc01-forward-server-inactive.png), [33](screenshots/33-dc01-test-netconnection-failed.png))
+- **The attack produced 4625 events but no lockout and every event said "Account currently disabled".** `jsmith` had been created in a disabled state. Enabled it and reset the password in Active Directory Users and Computers; the re-run produced "Unknown user name or bad password" and a 4740 lockout. ([39](screenshots/39-splunk-4625-failed-logons-raw.png), [41](screenshots/41-splunk-4625-bad-password-after-fix.png))
 - **Windows 11 setup demanded a network and an account.** Used the local-account route (Shift+F10 and `start ms-cxh:localonly`) to create a local account, then joined the domain afterwards.
 - **The first domain join failed with "user name or password is incorrect".** Reset the AD account passwords in Active Directory Users and Computers and retried; the join succeeded.
 
 ## What's next
 
-- Advanced audit policy via Group Policy (logon, credential validation, account management) and an account lockout threshold of 5
-- Splunk Universal Forwarder on DC01 and CLIENT01, shipping Windows Security and System logs
-- Run a PowerShell brute-force against `jsmith`, find it with Event ID 4625 (failed logon) and 4740 (account lockout), and write an SPL detection and a scheduled alert
+- Add detections for other common events (new account created 4720, logon from an unusual host) and write them up as Sigma rules in a separate repository
+- Work through the Splunk Boss of the SOC (BOTS) dataset and TryHackMe SOC Level 1
 
 ## Notes
 
